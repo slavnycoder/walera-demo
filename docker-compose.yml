@@ -34,6 +34,9 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgres://walera:${POSTGRES_PASSWORD:-walera}@postgres:5432/walera?sslmode=disable
+      # Shared HMAC secret — must match walera below. ≥32 bytes, fail-fast.
+      WALERA_AUTH_SIGNING_SECRET: ${WALERA_AUTH_SIGNING_SECRET:?WALERA_AUTH_SIGNING_SECRET required in .env (≥32 bytes)}
+      WALERA_AUTH_SIGNING_KID: ${WALERA_AUTH_SIGNING_KID:-v1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -44,7 +47,7 @@ services:
         - CMD
         - python
         - -c
-        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/auth/permissions?channel=_health',timeout=1).status==200 else 1)"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=1).status==200 else 1)"
       interval: 2s
       timeout: 2s
       retries: 30
@@ -66,6 +69,8 @@ services:
       WALERA_WAL_PUBLICATION_NAME: cdc_sse_streamer
       WALERA_AUTH_BACKEND_URL: http://backend:8000
       WALERA_AUTH_ALLOW_PLAINTEXT: "1"
+      WALERA_AUTH_SIGNING_SECRET: ${WALERA_AUTH_SIGNING_SECRET:?WALERA_AUTH_SIGNING_SECRET required in .env (≥32 bytes)}
+      WALERA_AUTH_SIGNING_KID: ${WALERA_AUTH_SIGNING_KID:-v1}
       WALERA_HTTP_CORS_ORIGINS: "http://localhost:${FRONTEND_HOST_PORT:-8081}"
       WALERA_HTTP_H2C_ENABLED: "true"
       GOGC: "200"

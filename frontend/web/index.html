@@ -245,10 +245,18 @@ async function hydrate() {
 }
 
 async function whoami() {
-  const r = await fetch(
-    `${API}/auth/permissions?channel=todo_lists%3A${LIST_ID}`,
-    { headers: { Authorization: `Bearer ${TOKEN}` } },
-  );
+  // Browser hits the auth backend directly via the same bearer token Walera
+  // uses at SSE handshake. The new wire is POST /auth/sessions — same shape
+  // response as the old GET endpoint, with the channel supplied in the body
+  // (it's still informational; the full multi-table whitelist comes back).
+  const r = await fetch(`${API}/auth/sessions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ channel: `todo_lists:${LIST_ID}` }),
+  });
   if (!r.ok) {
     $whoami.classList.add("bad");
     $whoami.textContent = `auth failed: ${r.status}`;

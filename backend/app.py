@@ -8,22 +8,32 @@ Two responsibilities, one process:
    sleep. Both commits bump the todo_lists root via DB triggers, so Walera
    delivers each transition to every subscriber of `todo_lists:<id>`.
 
-2. Walera auth backend (`GET /auth/permissions`) — implements the contract
-   from walera/docs/auth.md. A single demo token authorises the entire
-   `todo_lists / tasks / subtasks` whitelist.
+2. Walera auth backend — implements the HMAC-refresh contract:
+   - POST /auth/sessions    (Bearer → whitelist; one-shot handshake)
+   - POST /auth/permissions (HMAC-signed refresh; identifies user by user_id)
+   A single demo token authorises the `todo_lists / tasks / subtasks`
+   whitelist. After handshake walera never sees the bearer again — every
+   refresh is authenticated by HMAC-SHA256 over user_id||channel||ts||nonce
+   using the shared WALERA_AUTH_SIGNING_SECRET.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import random
+import sys
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Any
 
 import psycopg
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -32,6 +42,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("backend")
 
 DSN = os.environ["DATABASE_URL"]
+
+SIGNING_SECRET = os.environ.get("WALERA_AUTH_SIGNING_SECRET", "").encode()
+SIGNING_KID = os.environ.get("WALERA_AUTH_SIGNING_KID", "v1")
+if len(SIGNING_SECRET) < 32:
+    sys.stderr.write(
+        "backend: FATAL: WALERA_AUTH_SIGNING_SECRET must be set and ≥32 bytes "
+        "(got %d)\n" % len(SIGNING_SECRET)
+    )
+    sys.exit(1)
 
 # Single demo token. Whitelist contains every column of every table the UI
 # renders. `roots` declares which tables the user is allowed to subscribe to
@@ -48,6 +67,46 @@ PERMISSIONS: dict[str, dict[str, Any]] = {
         "ttl_seconds": 60,
     },
 }
+
+# user_id → whitelist reverse index, populated at import.
+USERS_BY_ID: dict[str, dict[str, Any]] = {p["user_id"]: p for p in PERMISSIONS.values()}
+
+# Replay protection — bounded LRU of recent nonces.
+_NONCE_TTL_SECONDS = 300
+_NONCE_MAX = 4096
+_TS_WINDOW_SECONDS = 60
+_nonce_lock = Lock()
+_nonce_cache: "OrderedDict[str, float]" = OrderedDict()
+
+
+def _check_nonce(nonce: str) -> bool:
+    """Return True if nonce is fresh; prune by age + size on every call."""
+    now = time.time()
+    with _nonce_lock:
+        cutoff = now - _NONCE_TTL_SECONDS
+        while _nonce_cache:
+            oldest = next(iter(_nonce_cache))
+            if _nonce_cache[oldest] >= cutoff:
+                break
+            _nonce_cache.popitem(last=False)
+        if nonce in _nonce_cache:
+            return False
+        _nonce_cache[nonce] = now
+        while len(_nonce_cache) > _NONCE_MAX:
+            _nonce_cache.popitem(last=False)
+        return True
+
+
+def _expected_sig(user_id: str, channel: str, ts: int, nonce: str) -> str:
+    mac = hmac.new(SIGNING_SECRET, digestmod=hashlib.sha256)
+    mac.update(user_id.encode())
+    mac.update(b"\n")
+    mac.update(channel.encode())
+    mac.update(b"\n")
+    mac.update(str(ts).encode())
+    mac.update(b"\n")
+    mac.update(nonce.encode())
+    return mac.hexdigest()
 
 _pool: AsyncConnectionPool | None = None
 
@@ -74,33 +133,87 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Walera auth backend
+# Walera auth backend — HMAC-refresh wire
 # ---------------------------------------------------------------------------
 
-@app.get("/auth/permissions")
-async def auth_permissions(
-    channel: str = Query(""),
+@app.post("/auth/sessions")
+async def auth_open_session(
+    body: dict[str, Any] = Body(default_factory=dict),
     authorization: str | None = Header(default=None),
 ):
-    if channel == "_health":
-        return {
-            "user_id": "u_service",
-            "tables": {"_health": ["id"]},
-            "roots": ["_health"],
-            "ttl_seconds": 60,
-        }
-
+    """Bearer → whitelist. Called exactly once by walera at SSE handshake.
+    Walera drops the bearer from memory after this call returns; subsequent
+    refreshes for the same subscriber arrive on POST /auth/permissions with
+    an HMAC signature instead of the bearer.
+    """
     token = ""
     if authorization and authorization.startswith("Bearer "):
         token = authorization[len("Bearer "):].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing_bearer")
 
     perms = PERMISSIONS.get(token)
     if perms is None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-    table = channel.split(":", 1)[0]
-    if table not in perms["tables"]:
-        raise HTTPException(status_code=403, detail="forbidden")
+    channel = body.get("channel", "") if isinstance(body, dict) else ""
+    if channel:
+        table = channel.split(":", 1)[0]
+        if table not in perms["tables"]:
+            raise HTTPException(status_code=403, detail="forbidden")
+    return perms
+
+
+@app.post("/auth/permissions")
+async def auth_refresh(request: Request):
+    """HMAC-authenticated refresh. Walera proves it's the same service that
+    completed a handshake by signing user_id||channel||ts||nonce with
+    WALERA_AUTH_SIGNING_SECRET. We verify the signature, sanity-check ts /
+    nonce, and return the current whitelist for that user_id.
+
+    Sentinel user_id="_health" is reserved for walera's CheckAuth liveness
+    probe — it returns a synthetic whitelist so a successful round-trip
+    proves both backend reachability AND that walera_secret is in sync.
+    """
+    sig = request.headers.get("X-Walera-Sig", "")
+    kid = request.headers.get("X-Walera-Kid", "")
+    if kid != SIGNING_KID or not sig:
+        raise HTTPException(status_code=401, detail="bad_sig_header")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=401, detail="bad_body")
+
+    user_id = body.get("user_id", "")
+    channel = body.get("channel", "")
+    ts = body.get("ts", 0)
+    nonce = body.get("nonce", "")
+    if not isinstance(user_id, str) or not isinstance(channel, str):
+        raise HTTPException(status_code=401, detail="bad_types")
+    if not isinstance(ts, int) or not isinstance(nonce, str) or not nonce:
+        raise HTTPException(status_code=401, detail="bad_types")
+
+    if abs(int(time.time()) - ts) > _TS_WINDOW_SECONDS:
+        raise HTTPException(status_code=401, detail="ts_window")
+
+    expected = _expected_sig(user_id, channel, ts, nonce)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=401, detail="bad_sig")
+
+    if not _check_nonce(nonce):
+        raise HTTPException(status_code=401, detail="replay")
+
+    if user_id == "_health":
+        return {
+            "user_id": "_health",
+            "tables": {"_health": ["id"]},
+            "roots": ["_health"],
+            "ttl_seconds": 60,
+        }
+
+    perms = USERS_BY_ID.get(user_id)
+    if perms is None:
+        raise HTTPException(status_code=404, detail="unknown_user")
     return perms
 
 

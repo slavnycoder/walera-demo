@@ -110,10 +110,21 @@ recovery flow, not the place to add chaos.
 ## Auth
 
 A single hardcoded token (`demo-token`) is shared between frontend and
-backend. The backend serves Walera's auth contract at
-`GET /auth/permissions?channel=...` (whitelist of tables and columns +
-permitted root tables). On boot the frontend calls this endpoint once
-to display the resolved user identity:
+backend. Walera's auth contract has two endpoints:
+
+- `POST /auth/sessions` — Bearer → whitelist. Called **once** by walera at
+  SSE handshake. Walera drops the bearer from memory after this returns.
+- `POST /auth/permissions` — refresh, authenticated by HMAC-SHA256 over
+  `user_id||channel||ts||nonce` using the shared
+  `WALERA_AUTH_SIGNING_SECRET` (see `.env`). The bearer never crosses this
+  endpoint, so a memory dump of walera contains zero user tokens past
+  handshake; revocation propagates as soon as the backend returns 403/404
+  on the next refresh (driven by walera's per-subscriber TTL).
+
+The frontend still uses `demo-token` over `Authorization: Bearer ...` to
+open the SSE connection. The backend serves both endpoints from
+`backend/app.py`. On boot the frontend resolves user identity for the
+banner:
 
 ```
 user=u_demo  roots=[todo_lists]  tables: todo_lists(id,title,updated_at)  tasks(...)  subtasks(...)
