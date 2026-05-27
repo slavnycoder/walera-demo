@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>test-walera · todo showcase</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; display: flex; align-items: center; gap: 0.5rem; }
+  .dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; background: #c33; transition: background 0.2s; }
+  .dot.on { background: #2a8; }
+  p.hint { color: #666; font-size: 0.9rem; }
+  .task, .subtask {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.35rem 0.4rem; border-radius: 0.3rem;
+  }
+  .subtask { margin-left: 2rem; font-size: 0.95em; }
+  .row.optimistic { background: rgba(180, 138, 0, 0.07); }
+  .title { flex: 1; }
+  .status-PENDING .title { }
+  .status-IN_PROGRESS .title { color: #b48a00; font-style: italic; }
+  .status-COMPLETED .title { color: #888; text-decoration: line-through; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px;
+    border: 2px solid #ccc; border-top-color: #b48a00;
+    border-radius: 50%; animation: sp 0.8s linear infinite;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  input[type="checkbox"] { width: 1.1rem; height: 1.1rem; cursor: pointer; }
+  input[type="checkbox"]:disabled { cursor: not-allowed; }
+  .events {
+    margin-top: 1.5rem; font-family: ui-monospace, monospace; font-size: 0.75rem;
+    color: #555; max-height: 12rem; overflow-y: auto;
+    border: 1px solid rgba(0,0,0,0.15); border-radius: 0.3rem; padding: 0.5rem;
+  }
+  .events h3 { margin: 0 0 0.3rem 0; font-size: 0.75rem; color: #888; }
+  .small { font-size: 0.8rem; color: #888; }
+  .whoami {
+    margin: 0 0 0.5rem 0; padding: 0.4rem 0.6rem;
+    border: 1px solid rgba(0,0,0,0.1); border-radius: 0.3rem;
+    font-family: ui-monospace, monospace;
+  }
+  .whoami.bad { border-color: #c33; color: #c33; }
+  h1 button {
+    font-size: 0.85rem; padding: 0.3rem 0.7rem;
+    border: 1px solid rgba(0,0,0,0.2); border-radius: 0.3rem;
+    background: rgba(255,255,255,0.5); cursor: pointer;
+  }
+  h1 button:hover { background: rgba(0,0,0,0.05); }
+  h1 button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button#complete-all { margin-left: auto; }
+</style>
+</head>
+<body>
+<h1>
+  <span id="conn-dot" class="dot"></span>
+  <span id="list-title">Loading…</span>
+  <button id="complete-all" type="button">Complete all</button>
+  <button id="uncomplete-all" type="button">Uncomplete all</button>
+</h1>
+<div id="whoami" class="small whoami">authorising…</div>
+<p class="hint">
+  Open this page in <strong>two tabs</strong>. Clicking a checkbox runs a
+  random 2-7 s task on the backend; the IN_PROGRESS / COMPLETED transitions
+  arrive in both tabs via Walera SSE.
+</p>
+
+<div id="list"></div>
+
+<div class="events">
+  <h3>SSE events</h3>
+  <div id="events"></div>
+</div>
+
+<script type="module">
+import { fetchEventSource } from "https://esm.sh/@microsoft/fetch-event-source@2.0.1";
+import Dexie, { liveQuery } from "https://esm.sh/dexie@4.0.10";
+
+const API     = "http://localhost:8000";
+const WALERA  = "http://localhost:8080";
+const TOKEN   = "demo-token";
+const LIST_ID = 1;
+
+const $list    = document.getElementById("list");
+const $title   = document.getElementById("list-title");
+const $dot     = document.getElementById("conn-dot");
+const $events  = document.getElementById("events");
+const $whoami  = document.getElementById("whoami");
+const $complete    = document.getElementById("complete-all");
+const $uncomplete  = document.getElementById("uncomplete-all");
+
+// IndexedDB-backed local mirror of the todo_list subtree. SSE tx events are
+// applied as in-place diffs; the UI reads exclusively from Dexie. Hydrate via
+// REST runs once on boot and on SSE reconnect (to close any gap during the
+// disconnect window — Walera does not replay missed events).
+const db = new Dexie("test-walera");
+db.version(1).stores({
+  todo_lists: "id",
+  tasks:      "id, todo_list_id",
+  subtasks:   "id, task_id",
+});
+
+const optimistic = new Map(); // "tasks:1" / "subtasks:3" -> "IN_PROGRESS" | "PENDING"
+let lastState = null;
+
+function log(msg) {
+  const line = document.createElement("div");
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  $events.prepend(line);
+  while ($events.children.length > 80) $events.removeChild($events.lastChild);
+}
+
+function effectiveStatus(kind, id, real) {
+  const key = `${kind}:${id}`;
+  const opt = optimistic.get(key);
+  if (!opt) return real;
+  // Server reached the optimistic guess -> drop the override and trust the
+  // wire. Anything else from the server while optimistic is set means the
+  // round-trip hasn't landed yet, so keep displaying the guess.
+  if (real === opt) {
+    optimistic.delete(key);
+    return real;
+  }
+  // Start path: optimistic IN_PROGRESS; server may have jumped to COMPLETED
+  // already if the SSE arrived after the async completion.
+  if (opt === "IN_PROGRESS" && real === "COMPLETED") {
+    optimistic.delete(key);
+    return real;
+  }
+  return opt;
+}
+
+function row(kind, item) {
+  const status   = effectiveStatus(kind, item.id, item.status);
+  const isOpt    = optimistic.has(`${kind}:${item.id}`);
+  const checked  = status === "COMPLETED";
+  // PENDING -> click to start; COMPLETED -> click to uncomplete;
+  // IN_PROGRESS -> disabled (server is working on it).
+  const disabled = status === "IN_PROGRESS";
+  const el = document.createElement("div");
+  el.className = `row ${kind === "subtasks" ? "subtask" : "task"} status-${status} ${isOpt ? "optimistic" : ""}`;
+  el.innerHTML = `
+    <input type="checkbox" data-kind="${kind}" data-id="${item.id}"
+           ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}>
+    ${status === "IN_PROGRESS" ? '<span class="spinner"></span>' : ""}
+    <span class="title">${item.title}</span>
+    <span class="small">${status}</span>
+  `;
+  return el;
+}
+
+function render(state) {
+  if (!state) { $title.textContent = "(no data)"; $list.innerHTML = ""; return; }
+  $title.textContent = state.title;
+  $list.innerHTML = "";
+  for (const t of state.tasks) {
+    $list.appendChild(row("tasks", t));
+    for (const s of t.subtasks) {
+      $list.appendChild(row("subtasks", s));
+    }
+  }
+}
+
+// Read the current todo_list subtree out of Dexie and build a render-ready
+// tree. Returns null when the list hasn't been hydrated yet.
+async function loadState() {
+  const head = await db.todo_lists.get(LIST_ID);
+  if (!head) return null;
+  const tasks = await db.tasks.where("todo_list_id").equals(LIST_ID).sortBy("id");
+  const taskIds = tasks.map(t => t.id);
+  const subs = taskIds.length
+    ? await db.subtasks.where("task_id").anyOf(taskIds).sortBy("id")
+    : [];
+  const byTask = new Map(taskIds.map(id => [id, []]));
+  for (const s of subs) byTask.get(s.task_id)?.push(s);
+  return {
+    ...head,
+    tasks: tasks.map(t => ({ ...t, subtasks: byTask.get(t.id) || [] })),
+  };
+}
+
+// Convert Walera/pgoutput field strings to JS scalars. pgoutput text mode
+// emits every column as a JSON string regardless of underlying type; the int8
+// PKs / FKs round-trip as "1" rather than 1.
+function coerceRow(table, raw) {
+  const row = { ...raw };
+  if ("id" in row) row.id = Number(row.id);
+  if (table === "tasks" && "todo_list_id" in row) row.todo_list_id = Number(row.todo_list_id);
+  if (table === "subtasks" && "task_id" in row) row.task_id = Number(row.task_id);
+  return row;
+}
+
+async function applyChange(change) {
+  const t = change.table;
+  if (!["todo_lists", "tasks", "subtasks"].includes(t)) return;
+  const pk = Number(change.pk);
+  if (change.op === "delete") {
+    await db.table(t).delete(pk);
+    return;
+  }
+  const incoming = coerceRow(t, change.data || {});
+  if (change.op === "insert") {
+    await db.table(t).put({ ...incoming, id: pk });
+    return;
+  }
+  // UPDATE: pgoutput may emit only the modified columns (absence ≠ null),
+  // so merge into the existing row instead of overwriting it.
+  const existing = await db.table(t).get(pk);
+  await db.table(t).put({ ...(existing || {}), ...incoming, id: pk });
+}
+
+async function applyTx(tx) {
+  await db.transaction("rw", db.todo_lists, db.tasks, db.subtasks, async () => {
+    for (const c of tx.changes || []) await applyChange(c);
+  });
+}
+
+// Initial hydrate (and gap-closer after SSE reconnect): pull full state from
+// the primary API and replace the local mirror for this list. Walera makes no
+// continuity guarantee across reconnect — clients must resync via REST.
+async function hydrate() {
+  const r = await fetch(`${API}/api/lists/${LIST_ID}`);
+  if (!r.ok) throw new Error(`GET /api/lists/${LIST_ID} -> ${r.status}`);
+  const state = await r.json();
+  await db.transaction("rw", db.todo_lists, db.tasks, db.subtasks, async () => {
+    const oldTaskIds = await db.tasks.where("todo_list_id").equals(state.id).primaryKeys();
+    if (oldTaskIds.length) await db.subtasks.where("task_id").anyOf(oldTaskIds).delete();
+    await db.tasks.where("todo_list_id").equals(state.id).delete();
+    await db.todo_lists.delete(state.id);
+
+    await db.todo_lists.put({ id: state.id, title: state.title, updated_at: state.updated_at });
+    for (const t of state.tasks) {
+      await db.tasks.put({
+        id: t.id, todo_list_id: state.id,
+        title: t.title, status: t.status, updated_at: t.updated_at,
+      });
+      for (const s of t.subtasks) {
+        await db.subtasks.put({
+          id: s.id, task_id: t.id,
+          title: s.title, status: s.status, updated_at: s.updated_at,
+        });
+      }
+    }
+  });
+}
+
+async function whoami() {
+  const r = await fetch(
+    `${API}/auth/permissions?channel=todo_lists%3A${LIST_ID}`,
+    { headers: { Authorization: `Bearer ${TOKEN}` } },
+  );
+  if (!r.ok) {
+    $whoami.classList.add("bad");
+    $whoami.textContent = `auth failed: ${r.status}`;
+    throw new Error(`auth ${r.status}`);
+  }
+  const p = await r.json();
+  const tables = Object.entries(p.tables)
+    .map(([t, cols]) => `${t}(${cols.join(",")})`)
+    .join("  ");
+  $whoami.textContent = `user=${p.user_id}  roots=[${p.roots.join(",")}]  tables: ${tables}`;
+}
+
+$list.addEventListener("change", async (e) => {
+  const el = e.target;
+  if (el.tagName !== "INPUT") return;
+  const kind = el.dataset.kind;
+  const id   = el.dataset.id;
+  if (!kind || !id) return;
+
+  // Toggle direction is decided by the checkbox's new state: checked -> start,
+  // unchecked -> uncomplete (COMPLETED -> PENDING).
+  const action = el.checked ? "start" : "uncomplete";
+  const optStatus = action === "start" ? "IN_PROGRESS" : "PENDING";
+  const key = `${kind}:${id}`;
+
+  optimistic.set(key, optStatus);
+  render(lastState);
+  log(`optimistic ${kind}:${id} -> ${optStatus}`);
+
+  try {
+    const r = await fetch(`${API}/api/${kind}/${id}/${action}`, { method: "POST" });
+    if (!r.ok) {
+      optimistic.delete(key);
+      render(lastState);
+      log(`${action} ${kind}:${id} failed: ${r.status}`);
+      return;
+    }
+    const body = await r.json();
+    if (action === "start") {
+      log(`start ${kind}:${id} ok (completion in ~${body.delay_seconds}s)`);
+    } else {
+      log(`uncomplete ${kind}:${id} ok`);
+    }
+  } catch (err) {
+    optimistic.delete(key);
+    render(lastState);
+    log(`${action} ${kind}:${id} error: ${err}`);
+  }
+});
+
+$complete.addEventListener("click", async () => {
+  if (!lastState) return;
+  $complete.disabled = true;
+  const touched = [];
+  for (const t of lastState.tasks) {
+    if (t.status === "PENDING") {
+      optimistic.set(`tasks:${t.id}`, "IN_PROGRESS");
+      touched.push(`tasks:${t.id}`);
+    }
+    for (const s of t.subtasks) {
+      if (s.status === "PENDING") {
+        optimistic.set(`subtasks:${s.id}`, "IN_PROGRESS");
+        touched.push(`subtasks:${s.id}`);
+      }
+    }
+  }
+  render(lastState);
+  log(`optimistic complete-all: ${touched.length} rows -> IN_PROGRESS`);
+
+  try {
+    const r = await fetch(`${API}/api/lists/${LIST_ID}/complete-all`, { method: "POST" });
+    if (!r.ok) {
+      for (const k of touched) optimistic.delete(k);
+      render(lastState);
+      log(`complete-all failed: ${r.status}`);
+      return;
+    }
+    const body = await r.json();
+    log(`complete-all ok (${body.tasks_started}+${body.subtasks_started} started)`);
+  } catch (err) {
+    for (const k of touched) optimistic.delete(k);
+    render(lastState);
+    log(`complete-all error: ${err}`);
+  } finally {
+    $complete.disabled = false;
+  }
+});
+
+$uncomplete.addEventListener("click", async () => {
+  if (!lastState) return;
+  $uncomplete.disabled = true;
+  const touched = [];
+  for (const t of lastState.tasks) {
+    if (t.status === "COMPLETED") {
+      optimistic.set(`tasks:${t.id}`, "PENDING");
+      touched.push(`tasks:${t.id}`);
+    }
+    for (const s of t.subtasks) {
+      if (s.status === "COMPLETED") {
+        optimistic.set(`subtasks:${s.id}`, "PENDING");
+        touched.push(`subtasks:${s.id}`);
+      }
+    }
+  }
+  render(lastState);
+  log(`optimistic uncomplete-all: ${touched.length} rows -> PENDING`);
+
+  try {
+    const r = await fetch(`${API}/api/lists/${LIST_ID}/uncomplete-all`, { method: "POST" });
+    if (!r.ok) {
+      for (const k of touched) optimistic.delete(k);
+      render(lastState);
+      log(`uncomplete-all failed: ${r.status}`);
+      return;
+    }
+    const body = await r.json();
+    log(`uncomplete-all ok (${body.tasks_reverted}+${body.subtasks_reverted} reverted)`);
+  } catch (err) {
+    for (const k of touched) optimistic.delete(k);
+    render(lastState);
+    log(`uncomplete-all error: ${err}`);
+  } finally {
+    $uncomplete.disabled = false;
+  }
+});
+
+await whoami();
+await hydrate();
+
+// liveQuery emits on every Dexie write (in this tab AND from other tabs
+// touching the shared IndexedDB), so two open tabs stay in sync even before
+// SSE delivers — though each tab also runs its own SSE subscription.
+liveQuery(loadState).subscribe({
+  next: (state) => { lastState = state; render(state); },
+  error: (err) => log(`liveQuery error: ${err}`),
+});
+
+let sseHadConnected = false;
+
+function summariseTx(tx) {
+  const counts = {};
+  for (const c of tx.changes || []) {
+    const key = `${c.table}.${c.op}`;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  return Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(" ");
+}
+
+fetchEventSource(`${WALERA}/sse/v1/todo_lists/${LIST_ID}`, {
+  headers: { Authorization: `Bearer ${TOKEN}` },
+  openWhenHidden: true,
+  async onopen(resp) {
+    if (resp.ok) {
+      $dot.classList.add("on");
+      log("SSE connected");
+      // If this is a reconnect, the disconnect window may have lost events.
+      // Close the gap by re-hydrating from the primary API before resuming.
+      if (sseHadConnected) {
+        try { await hydrate(); log("re-hydrated after reconnect"); }
+        catch (e) { log(`re-hydrate failed: ${e}`); }
+      }
+      sseHadConnected = true;
+    } else {
+      log(`SSE open failed: ${resp.status}`);
+      throw new Error(`open ${resp.status}`);
+    }
+  },
+  async onmessage(msg) {
+    if (msg.event === "tx") {
+      const tx = JSON.parse(msg.data);
+      try {
+        await applyTx(tx);
+        log(`tx #${tx.tx_id} applied: ${summariseTx(tx)}`);
+      } catch (e) {
+        log(`applyTx error: ${e}`);
+      }
+    } else if (msg.event === "error") {
+      log(`SSE error event: ${msg.data}`);
+    } else if (msg.event === "shutdown") {
+      log("SSE shutdown — server restarting");
+    }
+  },
+  onerror(err) {
+    $dot.classList.remove("on");
+    log(`SSE disconnect: ${err}`);
+    return 3000; // jittered retry
+  },
+});
+</script>
+</body>
+</html>

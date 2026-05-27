@@ -1,0 +1,97 @@
+name: test-walera
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: walera
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-walera}
+      POSTGRES_DB: walera
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_sender_timeout=30s
+    ports:
+      - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./db/001_publication.sql:/docker-entrypoint-initdb.d/001_publication.sql:ro
+      - ./db/002_schema.sql:/docker-entrypoint-initdb.d/002_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U walera -d walera"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [net]
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgres://walera:${POSTGRES_PASSWORD:-walera}@postgres:5432/walera?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${BACKEND_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/auth/permissions?channel=_health',timeout=1).status==200 else 1)"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    networks: [net]
+
+  walera:
+    image: ghcr.io/slavnycoder/walera:latest
+    pull_policy: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${WALERA_HOST_PORT:-8080}:8080"
+    environment:
+      WALERA_DATABASE_URL: postgres://walera:${POSTGRES_PASSWORD:-walera}@postgres:5432/walera?sslmode=disable
+      WALERA_WAL_PUBLICATION_NAME: cdc_sse_streamer
+      WALERA_AUTH_BACKEND_URL: http://backend:8000
+      WALERA_AUTH_ALLOW_PLAINTEXT: "1"
+      WALERA_HTTP_CORS_ORIGINS: "http://localhost:${FRONTEND_HOST_PORT:-8081}"
+      WALERA_HTTP_H2C_ENABLED: "true"
+      GOGC: "200"
+    healthcheck:
+      test: ["CMD", "/cdc-sse", "-healthcheck"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s
+    networks: [net]
+
+  frontend:
+    image: caddy:2-alpine
+    depends_on:
+      walera:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${FRONTEND_HOST_PORT:-8081}:8081"
+    volumes:
+      - ./frontend/web:/srv:ro
+      - ./frontend/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [net]
+
+networks:
+  net:
+    driver: bridge
+
+volumes:
+  pgdata:
