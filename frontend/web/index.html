@@ -162,7 +162,7 @@ function render(state) {
 }
 
 // Read the current todo_list subtree out of Dexie and build a render-ready
-// tree. Returns null when the list hasn't been hydrated yet.
+// tree. Returns null until the first `initial_data` SSE frame lands.
 async function loadState() {
   const head = await db.todo_lists.get(LIST_ID);
   if (!head) return null;
@@ -215,13 +215,11 @@ async function applyTx(tx) {
   });
 }
 
-// Initial hydrate (and gap-closer after SSE reconnect): pull full state from
-// the primary API and replace the local mirror for this list. Walera makes no
-// continuity guarantee across reconnect — clients must resync via REST.
-async function hydrate() {
-  const r = await fetch(`${API}/api/lists/${LIST_ID}`);
-  if (!r.ok) throw new Error(`GET /api/lists/${LIST_ID} -> ${r.status}`);
-  const state = await r.json();
+// Seed (and gap-close on reconnect) the local mirror from a Walera-delivered
+// `initial_data` SSE frame. Walera emits this frame at the start of every
+// SSE open, so the snapshot doubles as the post-reconnect refresher — no
+// REST `GET /api/lists/<id>` round-trip is needed.
+async function applyInitialData(state) {
   await db.transaction("rw", db.todo_lists, db.tasks, db.subtasks, async () => {
     const oldTaskIds = await db.tasks.where("todo_list_id").equals(state.id).primaryKeys();
     if (oldTaskIds.length) await db.subtasks.where("task_id").anyOf(oldTaskIds).delete();
@@ -242,20 +240,23 @@ async function hydrate() {
       }
     }
   });
+  // Drop any optimistic overlays — the snapshot is the new ground truth.
+  optimistic.clear();
 }
 
 async function whoami() {
-  // Browser hits the auth backend directly via the same bearer token Walera
-  // uses at SSE handshake. The new wire is POST /auth/sessions — same shape
-  // response as the old GET endpoint, with the channel supplied in the body
-  // (it's still informational; the full multi-table whitelist comes back).
+  // Browser hits the auth backend directly for the user-identity banner.
+  // We intentionally do NOT use the `initial_data` field from this
+  // response to seed Dexie — that's Walera's job, delivered as the first
+  // SSE frame after handshake. Keeping the two paths separate makes the
+  // demo honest about where the snapshot is coming from.
   const r = await fetch(`${API}/auth/sessions`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${TOKEN}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ channel: `todo_lists:${LIST_ID}` }),
+    body: JSON.stringify({}),
   });
   if (!r.ok) {
     $whoami.classList.add("bad");
@@ -384,7 +385,19 @@ $uncomplete.addEventListener("click", async () => {
 });
 
 await whoami();
-await hydrate();
+
+// Wipe the local mirror before SSE opens. The demo's contract is that
+// Walera's `initial_data` frame is the *sole* seed of Dexie; any rows
+// left over from a previous session would muddy that signal. liveQuery
+// will fire with `null` once and then again the moment initial_data
+// lands, so the UI shows "Loading…" until the SSE seed arrives.
+await db.transaction("rw", db.todo_lists, db.tasks, db.subtasks, async () => {
+  await db.subtasks.clear();
+  await db.tasks.clear();
+  await db.todo_lists.clear();
+});
+optimistic.clear();
+log("local mirror cleared — waiting for initial_data");
 
 // liveQuery emits on every Dexie write (in this tab AND from other tabs
 // touching the shared IndexedDB), so two open tabs stay in sync even before
@@ -393,8 +406,6 @@ liveQuery(loadState).subscribe({
   next: (state) => { lastState = state; render(state); },
   error: (err) => log(`liveQuery error: ${err}`),
 });
-
-let sseHadConnected = false;
 
 function summariseTx(tx) {
   const counts = {};
@@ -412,20 +423,25 @@ fetchEventSource(`${WALERA}/sse/v1/todo_lists/${LIST_ID}`, {
     if (resp.ok) {
       $dot.classList.add("on");
       log("SSE connected");
-      // If this is a reconnect, the disconnect window may have lost events.
-      // Close the gap by re-hydrating from the primary API before resuming.
-      if (sseHadConnected) {
-        try { await hydrate(); log("re-hydrated after reconnect"); }
-        catch (e) { log(`re-hydrate failed: ${e}`); }
-      }
-      sseHadConnected = true;
     } else {
       log(`SSE open failed: ${resp.status}`);
       throw new Error(`open ${resp.status}`);
     }
   },
   async onmessage(msg) {
-    if (msg.event === "tx") {
+    if (msg.event === "initial_data") {
+      // First frame after every successful open: Walera-delivered snapshot
+      // of the subscribed list. On a fresh boot this is the only seed; on
+      // a reconnect it replaces the local mirror so any events missed
+      // during the disconnect window are absorbed before tx flow resumes.
+      try {
+        const snapshot = JSON.parse(msg.data);
+        await applyInitialData(snapshot);
+        log(`initial_data applied (list=${snapshot.id}, tasks=${snapshot.tasks.length})`);
+      } catch (e) {
+        log(`initial_data error: ${e}`);
+      }
+    } else if (msg.event === "tx") {
       const tx = JSON.parse(msg.data);
       try {
         await applyTx(tx);

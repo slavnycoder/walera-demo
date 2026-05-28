@@ -2,19 +2,33 @@
 
 Two responsibilities, one process:
 
-1. Product API (`/api/...`) — reads the todo_list tree and starts tasks /
-   subtasks. Starting a task immediately commits status=IN_PROGRESS and
-   schedules an asynchronous transition to COMPLETED after a random 2-7 s
-   sleep. Both commits bump the todo_lists root via DB triggers, so Walera
-   delivers each transition to every subscriber of `todo_lists:<id>`.
+1. Product API (`/api/...`) — mutates tasks / subtasks. Starting a task
+   immediately commits status=IN_PROGRESS and schedules an asynchronous
+   transition to COMPLETED after a random 2-7 s sleep. Both commits bump
+   the todo_lists root via DB triggers, so Walera delivers each transition
+   to every subscriber of `todo_lists:<id>`.
+
+   There is no REST `GET /api/lists/<id>` here on purpose — the initial
+   snapshot for the subscribed list is delivered by Walera itself as the
+   first SSE frame (`event: initial_data`), built inside /auth/sessions
+   below. Mutation endpoints stay because mutations are the client →
+   server direction, which SSE does not carry.
 
 2. Walera auth backend — implements the HMAC-refresh contract:
-   - POST /auth/sessions    (Bearer → whitelist; one-shot handshake)
+   - POST /auth/sessions    (Bearer → whitelist + initial_data; one-shot handshake)
    - POST /auth/permissions (HMAC-signed refresh; identifies user by user_id)
+
    A single demo token authorises the `todo_lists / tasks / subtasks`
    whitelist. After handshake walera never sees the bearer again — every
    refresh is authenticated by HMAC-SHA256 over user_id||channel||ts||nonce
    using the shared WALERA_AUTH_SIGNING_SECRET.
+
+   The /auth/sessions response carries an `initial_data` field whenever
+   the channel is `todo_lists:<id>`. Walera compacts that JSON and
+   forwards it verbatim to the subscriber as the first SSE frame,
+   before any `tx` events. `initial_data` is documented as open-time
+   only, so refresh responses (which go to /auth/permissions) do not
+   include it.
 """
 
 from __future__ import annotations
@@ -141,10 +155,15 @@ async def auth_open_session(
     body: dict[str, Any] = Body(default_factory=dict),
     authorization: str | None = Header(default=None),
 ):
-    """Bearer → whitelist. Called exactly once by walera at SSE handshake.
-    Walera drops the bearer from memory after this call returns; subsequent
-    refreshes for the same subscriber arrive on POST /auth/permissions with
-    an HMAC signature instead of the bearer.
+    """Bearer → whitelist + initial_data. Called exactly once by walera at
+    SSE handshake. Walera drops the bearer from memory after this returns;
+    subsequent refreshes for the same subscriber arrive on
+    POST /auth/permissions with an HMAC signature instead of the bearer.
+
+    When the requested channel is `todo_lists:<id>` we attach the full
+    list subtree as `initial_data`. Walera compacts the JSON and emits
+    it to the subscriber as the first SSE frame, so the browser never
+    needs a separate REST round-trip to seed its local mirror.
     """
     token = ""
     if authorization and authorization.startswith("Bearer "):
@@ -157,11 +176,24 @@ async def auth_open_session(
         raise HTTPException(status_code=401, detail="unauthorized")
 
     channel = body.get("channel", "") if isinstance(body, dict) else ""
+    initial_data: Any = None
     if channel:
-        table = channel.split(":", 1)[0]
-        if table not in perms["tables"]:
+        table, _, pk = channel.partition(":")
+        if not table or table not in perms["tables"]:
             raise HTTPException(status_code=403, detail="forbidden")
-    return perms
+        if table == "todo_lists" and pk and pk != "all":
+            try:
+                list_id = int(pk)
+            except ValueError:
+                raise HTTPException(status_code=404, detail="bad_channel")
+            initial_data = await _build_list_snapshot(list_id)
+            if initial_data is None:
+                raise HTTPException(status_code=404, detail="list_not_found")
+
+    response = dict(perms)
+    if initial_data is not None:
+        response["initial_data"] = initial_data
+    return response
 
 
 @app.post("/auth/permissions")
@@ -227,8 +259,11 @@ async def _pool_required() -> AsyncConnectionPool:
     return _pool
 
 
-@app.get("/api/lists/{list_id}")
-async def get_list(list_id: int):
+async def _build_list_snapshot(list_id: int) -> dict[str, Any] | None:
+    """Assemble the full todo_lists/<id> subtree for embedding into the
+    /auth/sessions `initial_data` payload. Returns None when the list is
+    absent so the caller can map that to a 404 on the auth response.
+    """
     pool = await _pool_required()
     async with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -237,7 +272,7 @@ async def get_list(list_id: int):
         )
         head = await cur.fetchone()
         if head is None:
-            raise HTTPException(status_code=404, detail="list not found")
+            return None
 
         await cur.execute(
             "SELECT id, title, status, updated_at FROM tasks "

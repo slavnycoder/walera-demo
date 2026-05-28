@@ -7,11 +7,14 @@ client-integration shape: SSE events as a diff source over an IndexedDB
 mirror, optimistic UI updates with rollback, and bulk transactional ops.
 
 ```
-browser ──fetch──► backend ──UPDATE──► postgres
-   ▲                                       │
-   │  Dexie ◄──── apply tx changes ────────┘ WAL
-   │                                          │
-   └─── SSE ◄────────── walera ◄──────────────┘
+browser ──fetch (mutations only)──► backend ──UPDATE──► postgres
+   ▲                                                       │
+   │  Dexie ◄──── apply tx changes ────────────────────────┘ WAL
+   │                                                          │
+   └─── SSE (initial_data + tx) ◄────── walera ◄──────────────┘
+                                              │
+                                              └── /auth/sessions ──► backend
+                                                  (returns whitelist + snapshot)
 ```
 
 ## Stack
@@ -19,7 +22,7 @@ browser ──fetch──► backend ──UPDATE──► postgres
 | Service    | Port | What it does                                                    |
 | ---------- | ---- | --------------------------------------------------------------- |
 | postgres   | 5432 | PG 18 with `wal_level=logical` and publication `cdc_sse_streamer`. |
-| backend    | 8000 | FastAPI: product API + Walera auth backend.                     |
+| backend    | 8000 | FastAPI: mutation API + Walera auth backend (initial_data source). |
 | walera     | 8080 | `ghcr.io/slavnycoder/walera:latest`. Tails WAL, fans out SSE.    |
 | frontend   | 8081 | Caddy serving `frontend/web/index.html` (vanilla JS + Dexie).   |
 
@@ -67,24 +70,39 @@ boundary.
 ## How the frontend uses SSE
 
 The classic recipe ("treat SSE as a hint to refresh, fetch state from the
-primary API") works but wastes bandwidth. This demo shows the
-**diff-source** alternative:
+primary API") works but wastes bandwidth and pins the client to a second
+endpoint. This demo shows the **walera-native** alternative — the initial
+snapshot rides the same SSE channel as the live diffs:
 
-1. On boot: `whoami()` round-trip → `hydrate()` pulls the full subtree
-   from `/api/lists/1` and writes it into a Dexie (IndexedDB) database.
-2. SSE opens. Each `tx` event is parsed and applied to Dexie inside one
+1. On boot: `whoami()` round-trip resolves the user identity banner.
+   No REST hydrate.
+2. SSE opens against `walera/sse/v1/todo_lists/1`. Walera calls the
+   backend's `/auth/sessions`, which returns the whitelist **plus** an
+   `initial_data` field containing the full `todo_lists:1` subtree.
+   Walera compacts that JSON and sends it as the first SSE frame
+   (`event: initial_data`).
+3. The browser parses `initial_data` and writes the subtree into a
+   Dexie (IndexedDB) database in one transaction — this is the seed.
+4. Each subsequent `tx` event is parsed and applied to Dexie inside one
    IndexedDB transaction:
    - `insert` → `put` the full row.
    - `update` → merge with the existing row (pgoutput may emit only
      modified columns, so a naive overwrite would erase fields).
    - `delete` → `delete` by PK.
-3. Dexie's `liveQuery(loadState)` re-renders the UI on every write.
+5. Dexie's `liveQuery(loadState)` re-renders the UI on every write.
    Because IndexedDB is per-origin, two tabs of the showcase share the
    same database and react to each other's writes — though each tab
    also runs its own SSE subscription for symmetry.
-4. On SSE reconnect, the disconnect window may have lost events. We
-   call `hydrate()` again to close the gap. Walera makes **no continuity
-   guarantee** across reconnect — clients must resync via REST.
+6. On SSE reconnect, the disconnect window may have lost events.
+   Walera emits a fresh `initial_data` frame on every open, so we just
+   re-apply it as the new ground truth — no separate REST refresher.
+   Walera makes **no continuity guarantee** across reconnect, and
+   `initial_data` is the contract for closing that gap.
+
+The auth backend ships `initial_data` only on the open-time response.
+Background permission refreshes (`/auth/permissions`, HMAC-signed) are
+not allowed to re-seed state — that would let a TTL refresh silently
+overwrite the live diff stream.
 
 The optimistic overlay is a `Map<"kind:id", status>` consulted at render
 time. It gets cleared when the real status from Dexie catches up to the
@@ -112,8 +130,10 @@ recovery flow, not the place to add chaos.
 A single hardcoded token (`demo-token`) is shared between frontend and
 backend. Walera's auth contract has two endpoints:
 
-- `POST /auth/sessions` — Bearer → whitelist. Called **once** by walera at
-  SSE handshake. Walera drops the bearer from memory after this returns.
+- `POST /auth/sessions` — Bearer → whitelist (+ `initial_data` when the
+  body carries a `todo_lists:<id>` channel). Called **once** by walera at
+  SSE handshake; the `initial_data` payload becomes the first SSE frame.
+  Walera drops the bearer from memory after this returns.
 - `POST /auth/permissions` — refresh, authenticated by HMAC-SHA256 over
   `user_id||channel||ts||nonce` using the shared
   `WALERA_AUTH_SIGNING_SECRET` (see `.env`). The bearer never crosses this
@@ -153,8 +173,11 @@ If the token is wrong the banner turns red and SSE never opens.
 ## What's intentionally absent
 
 - No bundler / npm. Frontend uses native ES modules and esm.sh CDN.
-- No `Last-Event-ID` resume. Walera doesn't replay; we hydrate on
-  reconnect.
+- No `Last-Event-ID` resume. Walera doesn't replay; the
+  `initial_data` frame on every open is the reconnect refresher.
+- No REST `GET /api/lists/<id>` endpoint. The initial snapshot rides
+  the SSE channel via `initial_data`; the only HTTP calls the
+  frontend makes against the product API are mutations.
 - No multi-user / token switcher. One hardcoded user keeps the demo
   focused on the SSE-diff mechanics.
 - No wildcard subscription (`/sse/v1/todo_lists/all`). Exact-PK
