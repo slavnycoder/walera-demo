@@ -73,8 +73,8 @@
 </div>
 
 <script type="module">
-import { fetchEventSource } from "https://esm.sh/@microsoft/fetch-event-source@2.0.1";
 import Dexie, { liveQuery } from "https://esm.sh/dexie@4.0.10";
+import { connectWalera } from "./walera-client.js";
 
 const API     = "http://localhost:8000";
 const WALERA  = "http://localhost:8080";
@@ -416,50 +416,26 @@ function summariseTx(tx) {
   return Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(" ");
 }
 
-fetchEventSource(`${WALERA}/sse/v1/todo_lists/${LIST_ID}`, {
-  headers: { Authorization: `Bearer ${TOKEN}` },
-  openWhenHidden: true,
-  async onopen(resp) {
-    if (resp.ok) {
-      $dot.classList.add("on");
-      log("SSE connected");
-    } else {
-      log(`SSE open failed: ${resp.status}`);
-      throw new Error(`open ${resp.status}`);
-    }
+// All SSE plumbing — auto-reconnect, bearer header, JSON parsing,
+// event dispatch — lives in walera-client.js. The host page only
+// supplies app-specific behavior: how to apply the snapshot and how
+// to apply tx diffs to Dexie.
+connectWalera({
+  baseUrl: WALERA,
+  channel: `todo_lists/${LIST_ID}`,
+  token: TOKEN,
+  onOpen: () => $dot.classList.add("on"),
+  onDisconnect: () => $dot.classList.remove("on"),
+  onLog: log,
+  async onInitialData(snapshot) {
+    await applyInitialData(snapshot);
+    log(`initial_data applied (list=${snapshot.id}, tasks=${snapshot.tasks.length})`);
   },
-  async onmessage(msg) {
-    if (msg.event === "initial_data") {
-      // First frame after every successful open: Walera-delivered snapshot
-      // of the subscribed list. On a fresh boot this is the only seed; on
-      // a reconnect it replaces the local mirror so any events missed
-      // during the disconnect window are absorbed before tx flow resumes.
-      try {
-        const snapshot = JSON.parse(msg.data);
-        await applyInitialData(snapshot);
-        log(`initial_data applied (list=${snapshot.id}, tasks=${snapshot.tasks.length})`);
-      } catch (e) {
-        log(`initial_data error: ${e}`);
-      }
-    } else if (msg.event === "tx") {
-      const tx = JSON.parse(msg.data);
-      try {
-        await applyTx(tx);
-        log(`tx #${tx.tx_id} applied: ${summariseTx(tx)}`);
-      } catch (e) {
-        log(`applyTx error: ${e}`);
-      }
-    } else if (msg.event === "error") {
-      log(`SSE error event: ${msg.data}`);
-    } else if (msg.event === "shutdown") {
-      log("SSE shutdown — server restarting");
-    }
+  async onTx(tx) {
+    await applyTx(tx);
+    log(`tx #${tx.tx_id} applied: ${summariseTx(tx)}`);
   },
-  onerror(err) {
-    $dot.classList.remove("on");
-    log(`SSE disconnect: ${err}`);
-    return 3000; // jittered retry
-  },
+  onShutdown: () => log("SSE shutdown — server restarting"),
 });
 </script>
 </body>

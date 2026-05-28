@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "outDir": "./web",
+    "rootDir": "./src",
+    "declaration": false,
+    "removeComments": false,
+    "newLine": "lf",
+    "lib": ["es2022", "dom"]
+  },
+  "include": ["src/**/*.ts"]
+}

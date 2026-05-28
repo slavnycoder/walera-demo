@@ -164,10 +164,24 @@ If the token is wrong the banner turns red and SSE never opens.
 ├── backend/
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   └── app.py                  # FastAPI: /api + /auth/permissions
+│   └── app.py                  # FastAPI: mutation API + auth backend
 └── frontend/
     ├── Caddyfile
-    └── web/index.html          # vanilla ES modules + Dexie + fetch-event-source
+    ├── tsconfig.json
+    ├── src/
+    │   ├── walera-client.ts    # reusable, project-agnostic SSE wrapper
+    │   └── fetch-event-source.d.ts
+    └── web/
+        ├── index.html          # app glue: Dexie + walera-client.js
+        └── walera-client.js    # compiled — Caddy serves this directly
+```
+
+The wrapper is intentionally separated from the app glue so it can be
+lifted into another project unchanged. Re-compile after editing the
+`.ts` source:
+
+```bash
+cd frontend && npx -y -p typescript@5 tsc -p tsconfig.json
 ```
 
 ## What's intentionally absent
