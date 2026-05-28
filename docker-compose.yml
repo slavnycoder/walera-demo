@@ -55,8 +55,8 @@ services:
     networks: [net]
 
   walera:
-    image: walera:dev
-    pull_policy: never
+    image: ghcr.io/slavnycoder/walera:latest
+    pull_policy: always
     depends_on:
       postgres:
         condition: service_healthy
@@ -75,9 +75,11 @@ services:
       WALERA_HTTP_H2C_ENABLED: "true"
       # Token-bucket rate limiting was removed from walera — push it to
       # the upstream proxy if you need it. Concurrency caps remain at
-      # their built-in defaults (50k global, 10 per user); bump
-      # WALERA_LIMITS_PER_USER_CONCURRENT if a single demo token needs
-      # to fan out across many tabs.
+      # their built-in defaults (50k global, 10 per user). The demo
+      # shares one demo-token across every tab + reload, so reload
+      # storms briefly stack the per-user counter before old SSE
+      # connections release. Raise the cap so it's not the bottleneck.
+      WALERA_LIMITS_PER_USER_CONCURRENT: "200"
       GOGC: "200"
     healthcheck:
       test: ["CMD", "/cdc-sse", "-healthcheck"]
