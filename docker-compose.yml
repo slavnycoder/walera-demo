@@ -52,7 +52,7 @@ services:
     networks: [net]
 
   walera:
-    image: ghcr.io/slavnycoder/walera:3.0.0
+    image: ghcr.io/slavnycoder/walera:3.0.1
     pull_policy: always
     depends_on:
       postgres:
