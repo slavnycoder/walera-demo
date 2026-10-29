@@ -99,10 +99,10 @@ snapshot rides the same SSE channel as the live diffs:
    Walera makes **no continuity guarantee** across reconnect, and
    `initial_data` is the contract for closing that gap.
 
-The auth backend ships `initial_data` only on the open-time response.
-Background permission refreshes (`/auth/permissions`, HMAC-signed) are
-not allowed to re-seed state — that would let a TTL refresh silently
-overwrite the live diff stream.
+The auth backend ships `initial_data` on every `/auth/sessions` response,
+open or refresh, but Walera only ever emits the SSE `initial_data` frame
+on the open-time call — it ignores the field on background refreshes, so
+a TTL refresh can never silently overwrite the live diff stream.
 
 The optimistic overlay is a `Map<"kind:id", status>` consulted at render
 time. It gets cleared when the real status from Dexie catches up to the
@@ -128,26 +128,26 @@ recovery flow, not the place to add chaos.
 ## Auth
 
 A single hardcoded token (`demo-token`) is shared between frontend and
-backend. Walera's auth contract has two endpoints:
+backend. Walera's auth contract is a single endpoint:
 
 - `POST /auth/sessions` — Bearer → whitelist (+ `initial_data` when the
-  body carries a `todo_lists:<id>` channel). Called **once** by walera at
-  SSE handshake; the `initial_data` payload becomes the first SSE frame.
-  Walera drops the bearer from memory after this returns.
-- `POST /auth/permissions` — refresh, authenticated by HMAC-SHA256 over
-  `user_id||channel||ts||nonce` using the shared
-  `WALERA_AUTH_SIGNING_SECRET` (see `.env`). The bearer never crosses this
-  endpoint, so a memory dump of walera contains zero user tokens past
-  handshake; revocation propagates as soon as the backend returns 403/404
-  on the next refresh (driven by walera's per-subscriber TTL).
+  body carries a `todo_lists:<id>` channel). Walera calls this **both**
+  at SSE handshake and on every periodic refresh (every `ttl_seconds`)
+  while the stream is live, replaying the exact same bearer each time.
+  The `initial_data` payload only ever becomes an SSE frame on the
+  handshake call — Walera ignores it on refresh. Since it's the same
+  request both times, there's no separate refresh endpoint, no signing
+  secret, and no server-side session state: a token that stops
+  authenticating here (logout, expiry) ends the live stream with
+  `auth_revoked` on the next refresh.
 
-The frontend still uses `demo-token` over `Authorization: Bearer ...` to
-open the SSE connection. The backend serves both endpoints from
-`backend/app.py`. On boot the frontend resolves user identity for the
-banner:
+The frontend uses `demo-token` over `Authorization: Bearer ...` both to
+open the SSE connection and to resolve the identity banner. The backend
+serves `/auth/sessions` from `backend/app.py`. On boot the frontend
+hits it directly for the banner:
 
 ```
-user=u_demo  roots=[todo_lists]  tables: todo_lists(id,title,updated_at)  tasks(...)  subtasks(...)
+user=u_demo  tables: todo_lists(id,title,updated_at)  tasks(...)  subtasks(...)
 ```
 
 If the token is wrong the banner turns red and SSE never opens.

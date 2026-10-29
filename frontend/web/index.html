@@ -267,7 +267,7 @@ async function whoami() {
   const tables = Object.entries(p.tables)
     .map(([t, cols]) => `${t}(${cols.join(",")})`)
     .join("  ");
-  $whoami.textContent = `user=${p.user_id}  roots=[${p.roots.join(",")}]  tables: ${tables}`;
+  $whoami.textContent = `user=${p.user_id}  tables: ${tables}`;
 }
 
 $list.addEventListener("change", async (e) => {
