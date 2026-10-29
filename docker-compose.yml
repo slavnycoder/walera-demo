@@ -52,7 +52,7 @@ services:
     networks: [net]
 
   walera:
-    image: ghcr.io/slavnycoder/walera:3.0.1
+    image: ghcr.io/slavnycoder/walera:4.0.0
     pull_policy: always
     depends_on:
       postgres:
@@ -63,19 +63,13 @@ services:
       - "127.0.0.1:${WALERA_HOST_PORT:-8080}:8080"
     environment:
       WALERA_DATABASE_URL: postgres://walera:${POSTGRES_PASSWORD:-walera}@postgres:5432/walera?sslmode=disable
-      WALERA_WAL_PUBLICATION_NAME: cdc_sse_streamer
-      WALERA_WAL_BOOTSTRAP_MODE: verify  # db/001_publication.sql owns the publication
-      WALERA_AUTH_BACKEND_URL: http://backend:8000
+      WALERA_PUBLICATION: cdc_sse_streamer  # owned by db/001_publication.sql
+      WALERA_AUTH_URL: http://backend:8000
       WALERA_AUTH_ALLOW_PLAINTEXT: "1"
-      WALERA_HTTP_CORS_ORIGINS: "http://localhost:${FRONTEND_HOST_PORT:-8081}"
-      WALERA_HTTP_H2C_ENABLED: "true"
-      # Token-bucket rate limiting was removed from walera — push it to
-      # the upstream proxy if you need it. Concurrency caps remain at
-      # their built-in defaults (50k global, 10 per user). The demo
-      # shares one demo-token across every tab + reload, so reload
-      # storms briefly stack the per-user counter before old SSE
-      # connections release. Raise the cap so it's not the bottleneck.
-      WALERA_LIMITS_PER_USER_CONCURRENT: "200"
+      WALERA_CORS_ORIGINS: "http://localhost:${FRONTEND_HOST_PORT:-8081}"
+      # walera v4 caps each user at 10 concurrent streams (fixed). The demo
+      # shares one demo-token, so a reload storm can briefly hit 429 until
+      # old SSE connections close; the client reconnects automatically.
       GOGC: "200"
     healthcheck:
       test: ["CMD", "/cdc-sse", "-healthcheck"]
