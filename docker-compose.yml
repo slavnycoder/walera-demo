@@ -52,7 +52,7 @@ services:
     networks: [net]
 
   walera:
-    image: ghcr.io/slavnycoder/walera:latest
+    image: ghcr.io/slavnycoder/walera:3.0.0
     pull_policy: always
     depends_on:
       postgres:
@@ -64,6 +64,7 @@ services:
     environment:
       WALERA_DATABASE_URL: postgres://walera:${POSTGRES_PASSWORD:-walera}@postgres:5432/walera?sslmode=disable
       WALERA_WAL_PUBLICATION_NAME: cdc_sse_streamer
+      WALERA_WAL_BOOTSTRAP_MODE: verify  # db/001_publication.sql owns the publication
       WALERA_AUTH_BACKEND_URL: http://backend:8000
       WALERA_AUTH_ALLOW_PLAINTEXT: "1"
       WALERA_HTTP_CORS_ORIGINS: "http://localhost:${FRONTEND_HOST_PORT:-8081}"
